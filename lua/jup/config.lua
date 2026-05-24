@@ -34,6 +34,7 @@ M.defaults = {
     show_status     = "<leader>js",
     clear_outputs   = "<leader>jo",
     clear_cell      = "<leader>jO",
+    yank_output     = "<leader>jy",
     new_cell_code   = "<leader>jn",
     new_cell_md     = "<leader>jm",
     delete_cell     = "<leader>jd",

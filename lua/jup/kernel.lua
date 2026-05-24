@@ -327,6 +327,12 @@ function M.kernel_info(bufnr, callback)
   M.request(bufnr, "kernel_info", {}, callback)
 end
 
+--- Return the list of output objects accumulated for a cell, or nil.
+function M.get_cell_outputs(bufnr, cell_id)
+  local st = get(bufnr)
+  return st and st.cell_outputs[cell_id]
+end
+
 --- Clear output for a single cell by its exec id.
 function M.clear_cell_output(bufnr, cell_id)
   local st = get(bufnr)

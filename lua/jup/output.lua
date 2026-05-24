@@ -155,7 +155,8 @@ function M.format_outputs(outputs)
   local max  = cfg.display.max_output_lines
 
   local function push(text, hl)
-    for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+    local clean = cfg.display.strip_ansi and text:gsub("\27%[[%d;]*m", "") or text
+    for _, l in ipairs(vim.split(clean, "\n", { plain = true })) do
       if max > 0 and #virt >= max then
         table.insert(virt, {
           { "  ", "JupOutputBg" },
@@ -190,8 +191,7 @@ function M.format_outputs(outputs)
     elseif ot == "error" then
       push(string.format("%s: %s", out.ename or "Error", out.evalue or ""), "JupError")
       for _, tb in ipairs(out.traceback or {}) do
-        local clean = cfg.display.strip_ansi and tb:gsub("\27%[[%d;]*m", "") or tb
-        push(clean, "JupStderr")
+        push(tb, "JupStderr")
       end
     end
   end
@@ -216,6 +216,38 @@ function M.set_cell_output(bufnr, anchor_row, outputs, existing_id)
   }
   if existing_id then opts.id = existing_id end
   return vim.api.nvim_buf_set_extmark(bufnr, ns, anchor_row, 0, opts)
+end
+
+--- Convert a list of output objects to a plain text string (ANSI stripped).
+---@param outputs table[]
+---@return string
+function M.outputs_to_text(outputs)
+  local lines = {}
+  local function add(text)
+    text = text:gsub("\27%[[%d;]*m", "")
+    for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+      table.insert(lines, l)
+    end
+  end
+
+  for _, out in ipairs(outputs or {}) do
+    local ot = out.output_type
+    if ot == "stream" then
+      add(out.text or "")
+    elseif ot == "execute_result" or ot == "display_data" then
+      local data = out.data or {}
+      local text = data["text/plain"]
+      if text then
+        add(type(text) == "table" and table.concat(text, "") or text)
+      end
+    elseif ot == "error" then
+      add(string.format("%s: %s", out.ename or "Error", out.evalue or ""))
+      for _, tb in ipairs(out.traceback or {}) do
+        add(tb)
+      end
+    end
+  end
+  return table.concat(lines, "\n")
 end
 
 function M.clear_cell_output(bufnr, extmark_id)

@@ -174,6 +174,26 @@ function M.clear_outputs()
   buf.clear_stored_outputs(bufnr)
 end
 
+--- Yank the output of the cell under the cursor into the clipboard.
+function M.yank_cell_output()
+  local bufnr  = vim.api.nvim_get_current_buf()
+  local cell   = buf.current_cell(bufnr)
+  if not cell then
+    vim.notify("[jup.nvim] cursor is not inside a cell", vim.log.levels.WARN)
+    return
+  end
+  local cell_id = buf.cell_exec_id(bufnr, cell.sep_row)
+  local outputs = kernel.get_cell_outputs(bufnr, cell_id)
+  if not outputs or #outputs == 0 then
+    vim.notify("[jup.nvim] no output for this cell", vim.log.levels.INFO)
+    return
+  end
+  local text = output.outputs_to_text(outputs)
+  vim.fn.setreg("+", text)
+  vim.fn.setreg('"', text)
+  vim.notify("[jup.nvim] output copied to clipboard", vim.log.levels.INFO)
+end
+
 --- Clear output for the cell under the cursor.
 function M.clear_cell_output()
   local bufnr   = vim.api.nvim_get_current_buf()
@@ -329,6 +349,7 @@ local _keymap_actions = {
   show_status   = { function() M.show_status()             end, "Jup: status" },
   clear_outputs = { function() M.clear_outputs()           end, "Jup: clear all outputs" },
   clear_cell    = { function() M.clear_cell_output()       end, "Jup: clear cell output" },
+  yank_output   = { function() M.yank_cell_output()        end, "Jup: yank cell output to clipboard" },
   new_cell_code = { function() M.new_cell("code")          end, "Jup: new code cell" },
   new_cell_md   = { function() M.new_cell("markdown")      end, "Jup: new markdown cell" },
   delete_cell   = { function() M.delete_cell()             end, "Jup: delete cell" },
