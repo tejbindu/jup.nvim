@@ -1,0 +1,208 @@
+*jup.txt*  Edit and run Jupyter notebooks inside Neovim
+
+                                                                    *jup.nvim*
+
+==============================================================================
+CONTENTS                                                        *jup-contents*
+
+  1. Introduction ..................... |jup-introduction|
+  2. Requirements ..................... |jup-requirements|
+  3. Setup ............................ |jup-setup|
+  4. Buffer Format .................... |jup-format|
+  5. Commands ......................... |jup-commands|
+  6. Lua API .......................... |jup-api|
+  7. Configuration .................... |jup-config|
+  8. Highlights ....................... |jup-highlights|
+
+==============================================================================
+1. INTRODUCTION                                             *jup-introduction*
+
+jup.nvim lets you open, edit, and execute Jupyter notebooks (.ipynb) directly
+in Neovim without leaving the editor.
+
+  • Notebooks are displayed in a human-readable percent format (like VS Code
+    interactive notebooks or jupytext's py:percent format).
+  • Each cell is separated by a `# %% [type]` line.
+  • Cell outputs are rendered inline as virtual text below each cell.
+  • Kernel communication uses a Python bridge (jupyter_client over ZeroMQ).
+
+==============================================================================
+2. REQUIREMENTS                                             *jup-requirements*
+
+  • Neovim 0.9+
+  • Python 3.8+ with `jupyter_client` installed:
+      pip install jupyter_client
+
+==============================================================================
+3. SETUP                                                        *jup-setup*
+
+Add to your Neovim config (lazy.nvim example): >
+
+  {
+    "yourusername/jup.nvim",
+    ft = "ipynb",
+    config = function()
+      require("jup").setup({
+        python_path  = "python3",
+        kernel = { default = "python3" },
+      })
+    end,
+  }
+<
+Minimal setup with no options: >
+
+  require("jup").setup()
+<
+The plugin auto-installs BufReadCmd / BufWriteCmd autocmds, so any .ipynb
+file opened after setup() is handled automatically.
+
+Optional keymaps: >
+
+  local jup = require("jup")
+  vim.keymap.set("n", "<leader>jr",  jup.run_cell,      { desc = "Run cell" })
+  vim.keymap.set("n", "<leader>jR",  jup.run_all,       { desc = "Run all" })
+  vim.keymap.set("n", "<leader>jc",  jup.connect,       { desc = "Connect kernel" })
+  vim.keymap.set("n", "<leader>jx",  jup.interrupt,     { desc = "Interrupt" })
+  vim.keymap.set("n", "<leader>jX",  jup.restart,       { desc = "Restart kernel" })
+  vim.keymap.set("n", "<leader>jo",  jup.clear_outputs, { desc = "Clear outputs" })
+  vim.keymap.set("n", "]j",          jup.goto_next_cell,{ desc = "Next cell" })
+  vim.keymap.set("n", "[j",          jup.goto_prev_cell,{ desc = "Prev cell" })
+<
+==============================================================================
+4. BUFFER FORMAT                                                *jup-format*
+
+Notebooks are rendered using the percent format: >
+
+  # %% [code]
+  import pandas as pd
+  df = pd.read_csv("data.csv")
+  df.head()
+
+  # %% [markdown]
+  ## Results
+
+  The data looks good.
+
+  # %% [code]
+  df.describe()
+<
+Rules:
+  • Each cell starts with `# %% [type]` where type is `code`, `markdown`, or
+    `raw`. The type tag is case-insensitive.
+  • The separator line itself is not part of the cell source.
+  • Outputs appear as virtual lines below the cell; they are NOT in the buffer
+    text and are not saved to the file (only the outputs stored in the .ipynb
+    are saved on write).
+  • After execution, outputs are held in memory and updated in real time.
+
+==============================================================================
+5. COMMANDS                                                    *jup-commands*
+
+Kernel lifecycle:
+  *:JupConnect* [name|file]   Start or connect to a kernel.
+                              With no argument uses `kernel.default` from
+                              config. Pass a kernel name (e.g. `python3`) or
+                              a path to a connection JSON file.
+  *:JupDisconnect*            Stop the bridge for this buffer.
+  *:JupRestart*               Restart the kernel.
+  *:JupInterrupt*             Interrupt running execution.
+  *:JupKernelInfo*            Display kernel language and version.
+
+Execution:
+  *:JupRun*                   Execute the cell under the cursor.
+  *:JupRunAll*                Execute all cells in order.
+  *:JupRunAbove*              Execute all cells above the cursor.
+  *:JupRunBelow*              Execute current cell and all below.
+
+Outputs:
+  *:JupClearOutputs*          Clear all cell outputs.
+  *:JupClearCell*             Clear output of the cell under the cursor.
+
+Editing:
+  *:JupNewCell* [type]        Insert a new cell below the cursor.
+  *:JupDeleteCell*            Delete the cell under the cursor.
+  *:JupNextCell*              Move to the next cell.
+  *:JupPrevCell*              Move to the previous cell.
+
+File:
+  *:JupSave*                  Write buffer back to the .ipynb file.
+                              (`:w` also works via BufWriteCmd.)
+  *:JupStatus*                Show kernel connection status.
+
+==============================================================================
+6. LUA API                                                        *jup-api*
+
+All functions operate on the current window's buffer unless noted.
+
+Kernel:
+  `require("jup").setup(opts)`          Configure the plugin.
+  `require("jup").connect(opts)`        opts: {kernel_name?, connection_file?}
+  `require("jup").disconnect()`
+  `require("jup").restart()`
+  `require("jup").interrupt()`
+  `require("jup").kernel_info()`
+
+Execution:
+  `require("jup").run_cell([cb])`       cb(err) called on completion.
+  `require("jup").run_all()`
+  `require("jup").run_above()`
+  `require("jup").run_below()`
+
+Navigation:
+  `require("jup").goto_next_cell()`
+  `require("jup").goto_prev_cell()`
+
+Editing:
+  `require("jup").new_cell(type)`       type: "code"|"markdown"|"raw"
+  `require("jup").delete_cell()`
+
+Output:
+  `require("jup").clear_outputs()`
+  `require("jup").clear_cell_output()`
+
+File:
+  `require("jup").save()`
+
+==============================================================================
+7. CONFIGURATION                                               *jup-config*
+
+Default values: >
+
+  require("jup").setup({
+    python_path = "python3",
+
+    kernel = {
+      default = "python3",
+      timeout = 30000,        -- ms to wait for kernel ready
+    },
+
+    display = {
+      max_output_lines = 100, -- 0 = unlimited
+      image_placeholder = true,
+      strip_ansi = true,      -- strip ANSI codes from tracebacks
+    },
+
+    -- Signs shown in the sign column (can use Nerd Font icons)
+    signs = {
+      running = "▶",
+      success = "✓",
+      error   = "✗",
+    },
+  })
+<
+==============================================================================
+8. HIGHLIGHTS                                                *jup-highlights*
+
+Override these highlight groups after setup: >
+
+  vim.api.nvim_set_hl(0, "JupSeparator",   { fg = "#7aa2f7", bold = true })
+  vim.api.nvim_set_hl(0, "JupSeparatorMd", { fg = "#bb9af7", bold = true })
+  vim.api.nvim_set_hl(0, "JupRunning",     { fg = "#e0af68" })
+  vim.api.nvim_set_hl(0, "JupStdout",      { fg = "#9ece6a" })
+  vim.api.nvim_set_hl(0, "JupStderr",      { fg = "#f7768e" })
+  vim.api.nvim_set_hl(0, "JupResult",      { fg = "#c0caf5" })
+  vim.api.nvim_set_hl(0, "JupError",       { fg = "#f7768e", bold = true })
+  vim.api.nvim_set_hl(0, "JupExecCount",   { fg = "#73daca" })
+<
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:
