@@ -9,6 +9,22 @@ local buf      = require("jup.buffer")
 local kernel   = require("jup.kernel")
 local output   = require("jup.output")
 
+-- ── Internal helpers ──────────────────────────────────────────────────────────
+
+-- Return the current buffer if it is a loaded notebook, otherwise search the
+-- current tab's windows for one. This lets kernel/save commands work even when
+-- the cursor is sitting in a sidebar (neotree, etc.) with the notebook visible
+-- in another window.
+local function _notebook_buf()
+  local cur = vim.api.nvim_get_current_buf()
+  if buf.is_loaded(cur) then return cur end
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local b = vim.api.nvim_win_get_buf(win)
+    if buf.is_loaded(b) then return b end
+  end
+  return cur  -- caller's "not a notebook" error handles this
+end
+
 -- ── Setup ─────────────────────────────────────────────────────────────────────
 
 ---@param opts table|nil  see config.lua for available keys
@@ -388,22 +404,6 @@ function M._apply_keymaps(bufnr)
       })
     end
   end
-end
-
--- ── Internal helpers ──────────────────────────────────────────────────────────
-
--- Return the current buffer if it is a loaded notebook, otherwise search the
--- current tab's windows for one. This lets kernel/save commands work even when
--- the cursor is sitting in a sidebar (neotree, etc.) with the notebook visible
--- in another window.
-local function _notebook_buf()
-  local cur = vim.api.nvim_get_current_buf()
-  if buf.is_loaded(cur) then return cur end
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    local b = vim.api.nvim_win_get_buf(win)
-    if buf.is_loaded(b) then return b end
-  end
-  return cur  -- caller's "not a notebook" error handles this
 end
 
 function M._ensure_connected(bufnr, callback)
