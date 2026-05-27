@@ -55,6 +55,12 @@ function M.load(bufnr, path)
     cells_meta     = cells_meta,
   }
 
+  -- Disable swap file before writing: .ipynb is managed entirely by jup
+  -- (BufWriteCmd handles saves), so a swap file serves no purpose and its
+  -- presence triggers E325 when nvim_buf_set_lines is called.
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].buftype  = "acwrite"
+
   local lines = notebook.notebook_to_lines(nb)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.bo[bufnr].modified = false
@@ -311,6 +317,9 @@ function M._scaffold(bufnr, path)
   }
 
   M.init_state(bufnr, path, nb)
+
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].buftype  = "acwrite"
 
   local lines = notebook.notebook_to_lines(nb)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
