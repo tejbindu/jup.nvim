@@ -1,7 +1,7 @@
 -- Manages the notebook buffer lifecycle:
---   BufReadCmd  → parse .ipynb → write cell format → set up extmarks
---   BufWriteCmd → parse buffer → serialize .ipynb → write file
---   BufDelete   → clean up kernel and extmarks
+--   BufReadCmd  → parse .ipynb → write cell format → insert output blocks → set up extmarks
+--   BufWriteCmd → parse buffer (strips output blocks) → serialize .ipynb → write file
+--   BufWipeout  → clean up kernel
 
 local M = {}
 
@@ -20,14 +20,12 @@ local _state = {}
 ---@param bufnr integer
 ---@param path string  path to .ipynb file (resolved to absolute internally)
 function M.load(bufnr, path)
-  -- Guard: only load once per buffer
   if _state[bufnr] then return end
 
   path = vim.fn.fnamemodify(path, ":p")
 
   local raw = M._read_file(path)
 
-  -- File doesn't exist or is empty (e.g., just created by a file manager) → scaffold
   if not raw or raw == "" then
     M._scaffold(bufnr, path)
     return
@@ -39,8 +37,6 @@ function M.load(bufnr, path)
     return
   end
 
-  -- Store per-cell metadata (outputs, execution_count, cell id, metadata)
-  -- so we can round-trip them correctly on save.
   local cells_meta = {}
   for _, c in ipairs(nb.cells) do
     table.insert(cells_meta, {
@@ -52,32 +48,26 @@ function M.load(bufnr, path)
   end
 
   _state[bufnr] = {
-    path       = path,
-    nb_meta    = nb.metadata,
-    nbformat   = nb.nbformat,
+    path           = path,
+    nb_meta        = nb.metadata,
+    nbformat       = nb.nbformat,
     nbformat_minor = nb.nbformat_minor,
-    cells_meta = cells_meta,
+    cells_meta     = cells_meta,
   }
 
-  -- Render cells into buffer
   local lines = notebook.notebook_to_lines(nb)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.bo[bufnr].modified = false
 
-  -- Apply syntax / filetype
   M._set_filetype(bufnr, nb.metadata)
 
-  -- Decorate separator lines
   output.setup_highlights()
+
+  -- Insert saved output blocks BEFORE decorating so borders land at correct rows
+  M._restore_outputs(bufnr, nb.cells)
   output.decorate_separators(bufnr)
 
-  -- Restore saved outputs as virtual lines
-  M._restore_outputs(bufnr, nb.cells)
-
-  -- Apply buffer-local keymaps
   require("jup")._apply_keymaps(bufnr)
-
-  -- Attach autocmds for this buffer
   M._attach_autocmds(bufnr)
 end
 
@@ -90,10 +80,10 @@ function M.save(bufnr)
     return
   end
 
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local lines  = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local parsed = notebook.lines_to_cells(lines)
 
-  -- Build full cell list, merging saved metadata with current source
+  -- Build full cell list merging current source with saved metadata (outputs, ids, etc.)
   local full_cells = {}
   for i, pc in ipairs(parsed) do
     local meta = st.cells_meta[i] or {}
@@ -120,7 +110,6 @@ function M.save(bufnr)
     return
   end
 
-  -- Pretty-print: use python-json-tool if available, else raw
   local pretty = M._pretty_json(json)
 
   local f, err = io.open(st.path, "w")
@@ -134,18 +123,16 @@ function M.save(bufnr)
   vim.bo[bufnr].modified = false
   vim.notify("[jup.nvim] saved " .. vim.fn.fnamemodify(st.path, ":t"), vim.log.levels.INFO)
 
-  -- Refresh separator decoration (user may have added new cells)
   output.decorate_separators(bufnr)
 end
 
 -- ── Cell queries ──────────────────────────────────────────────────────────────
 
 --- Return cell info at cursor in `bufnr`.
----@return table|nil  {cell_type, sep_row, end_row, source, cell_index}
+---@return table|nil
 function M.current_cell(bufnr)
-  local row = vim.api.nvim_win_get_cursor(0)[1] - 1  -- 0-indexed
-  local cell = notebook.cell_at_row(bufnr, row)
-  return cell
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  return notebook.cell_at_row(bufnr, row)
 end
 
 --- Return all parsed cells for `bufnr`.
@@ -154,10 +141,10 @@ function M.all_cells(bufnr)
   return notebook.lines_to_cells(lines)
 end
 
---- Generate a stable cell_id string for a given cell during execution.
---- This is the runtime ID used to route kernel output — it resets on reload.
-function M.cell_exec_id(bufnr, sep_row)
-  return string.format("buf%d_row%d", bufnr, sep_row)
+--- Generate the runtime cell_id used to route kernel output.
+--- Encodes cell_index (stable across row insertions from output blocks).
+function M.cell_exec_id(bufnr, cell_index)
+  return string.format("buf%d_idx%d", bufnr, cell_index)
 end
 
 -- ── State accessors ───────────────────────────────────────────────────────────
@@ -173,11 +160,23 @@ end
 
 function M.cleanup(bufnr)
   kernel.stop(bufnr)
-  output.clear_all_outputs(bufnr)
   _state[bufnr] = nil
 end
 
---- Clear stored cell outputs (does not touch extmarks).
+--- Update structured outputs for one cell in cells_meta (called by kernel on each output event).
+---@param bufnr integer
+---@param cell_index integer  1-based
+---@param outputs table[]
+function M.update_cell_outputs(bufnr, cell_index, outputs)
+  local st = _state[bufnr]
+  if not st then return end
+  local cm = st.cells_meta[cell_index]
+  if cm then
+    cm.outputs = vim.deepcopy(outputs)
+  end
+end
+
+--- Clear stored cell outputs (both cells_meta and output blocks in the buffer).
 function M.clear_stored_outputs(bufnr)
   local st = _state[bufnr]
   if not st then return end
@@ -185,6 +184,7 @@ function M.clear_stored_outputs(bufnr)
     cm.outputs         = {}
     cm.execution_count = nil
   end
+  output.clear_all_output_blocks(bufnr)
 end
 
 --- Initialize buffer state for a newly scaffolded notebook.
@@ -224,7 +224,7 @@ function M._attach_autocmds(bufnr)
     end,
   })
 
-  -- Re-decorate after the buffer is modified (new cells may have been added)
+  -- Re-decorate after text changes (debounced)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group    = grp,
     buffer   = bufnr,
@@ -239,7 +239,6 @@ function M._attach_autocmds(bufnr)
       end, 300)
     end,
   })
-
 end
 
 -- ── Internal helpers ──────────────────────────────────────────────────────────
@@ -253,30 +252,33 @@ function M._read_file(path)
 end
 
 function M._set_filetype(bufnr, metadata)
-  local lang = (metadata.kernelspec or {}).language or "python"
-  -- Map kernel language to Neovim filetype
+  local lang   = (metadata.kernelspec or {}).language or "python"
   local ft_map = { python = "python", julia = "julia", r = "r", ruby = "ruby" }
-  local ft = ft_map[lang] or "python"
-  vim.bo[bufnr].filetype = ft
+  vim.bo[bufnr].filetype = ft_map[lang] or "python"
 end
 
+--- Insert output blocks for all cells that have saved outputs.
+--- Inserted in reverse order so earlier row numbers stay valid across insertions.
 function M._restore_outputs(bufnr, cells)
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local lines  = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local parsed = notebook.lines_to_cells(lines)
-  for i, pc in ipairs(parsed) do
-    local c = cells[i]
+
+  for i = #parsed, 1, -1 do
+    local pc = parsed[i]
+    local c  = cells[i]
     if c and c.cell_type == "code" and c.outputs and #c.outputs > 0 then
-      local anchor = pc.end_row
-      local eid = output.set_cell_output(bufnr, anchor, c.outputs, nil)
-      -- Register with kernel module so execute() can clear it on re-run
-      local cell_id = M.cell_exec_id(bufnr, pc.sep_row)
-      kernel.register_restored_extmark(bufnr, cell_id, eid)
+      local text_lines = output.format_output_lines(c.outputs)
+      if #text_lines > 0 then
+        local block = { notebook.make_output_separator() }
+        for _, l in ipairs(text_lines) do table.insert(block, l) end
+        local insert_at = pc.source_end_row + 1
+        vim.api.nvim_buf_set_lines(bufnr, insert_at, insert_at, false, block)
+      end
     end
   end
 end
 
 function M._pretty_json(json_str)
-  -- Attempt to pretty-print via Python; fall back to raw on failure
   local tmp = os.tmpname()
   local f = io.open(tmp, "w")
   if not f then return json_str end
@@ -286,9 +288,7 @@ function M._pretty_json(json_str)
   local out = vim.fn.system("python3 -m json.tool --indent 1 " .. vim.fn.shellescape(tmp))
   os.remove(tmp)
 
-  if vim.v.shell_error == 0 and out ~= "" then
-    return out
-  end
+  if vim.v.shell_error == 0 and out ~= "" then return out end
   return json_str
 end
 

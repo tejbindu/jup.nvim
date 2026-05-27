@@ -7,14 +7,22 @@
 --   # %% [markdown]
 --   markdown content here
 --
--- Outputs are stored in buf-state and shown only via virtual lines.
+-- Output blocks are stored as real buffer lines between the source and
+-- the next cell separator:
+--   # %%
+--   print(x)
+--   # %% [out]
+--   42
+--
+--   # %% [markdown]
 
 local M = {}
+
+local OUTPUT_SEP = "# %% [out]"
 
 local _cell_id_counter = 0
 local function new_cell_id()
   _cell_id_counter = _cell_id_counter + 1
-  -- Simple 8-char hex-ish ID compatible with nbformat 4.5
   return string.format("%08x", _cell_id_counter + os.time())
 end
 
@@ -80,22 +88,20 @@ end
 
 -- ─── Buffer format ────────────────────────────────────────────────────────────
 
---- Convert a notebook model to buffer lines.
+--- Convert a notebook model to buffer lines (no output blocks; those are added
+--- separately by buffer._restore_outputs).
 ---@param notebook table
 ---@return string[] lines
 function M.notebook_to_lines(notebook)
   local out = {}
   for i, cell in ipairs(notebook.cells) do
-    -- Separator line
     table.insert(out, M.make_separator(cell.cell_type))
 
-    -- Source lines (trailing newline stripped since lines are split)
     local src = cell.source:gsub("\n$", "")
     for _, l in ipairs(vim.split(src, "\n", { plain = true })) do
       table.insert(out, l)
     end
 
-    -- Blank line between cells for readability
     if i < #notebook.cells then
       table.insert(out, "")
     end
@@ -103,46 +109,98 @@ function M.notebook_to_lines(notebook)
   return out
 end
 
---- Parse buffer lines back to a list of cell objects (no outputs/meta, source only).
+--- Parse buffer lines back to a list of cell objects.
+--- Output blocks (# %% [out]) are excluded from source but tracked as
+--- output_sep_row / output_end_row on the preceding code cell.
 ---@param lines string[]
----@return table[] cells  each has .cell_type, .source, .sep_row (0-indexed)
+---@return table[] cells  each has: cell_type, source, sep_row, source_end_row,
+---                       end_row, output_sep_row (nil if none), output_end_row (nil if none),
+---                       cell_index (1-based)
 function M.lines_to_cells(lines)
-  local cells = {}
-  local current = nil
+  local cells    = {}
+  local current  = nil
   local src_lines = {}
+  local src_rows  = {}   -- 0-indexed row for each entry in src_lines
+  local out_lines = {}   -- {row, line} for output block content
+  local in_output = false
 
   local function flush(next_row)
     if not current then return end
+
     -- Trim trailing blank lines from source
     while #src_lines > 0 and src_lines[#src_lines] == "" do
       table.remove(src_lines)
+      table.remove(src_rows)
     end
-    current.source   = table.concat(src_lines, "\n")
-    current.end_row  = (next_row or (#lines)) - 1  -- inclusive, 0-indexed
+    current.source  = table.concat(src_lines, "\n")
+    current.end_row = (next_row or (#lines)) - 1
+
+    if not current.output_sep_row then
+      -- No output block: source_end_row is the last non-blank source row
+      current.source_end_row = src_rows[#src_rows] or current.sep_row
+    end
+    -- (source_end_row is already set when we first see # %% [out])
+
+    -- Trim trailing blank lines from output content
+    while #out_lines > 0 and out_lines[#out_lines].line == "" do
+      table.remove(out_lines)
+    end
+    if current.output_sep_row then
+      current.output_end_row = #out_lines > 0
+        and out_lines[#out_lines].row
+        or current.output_sep_row  -- empty block: just the separator line itself
+    end
+
     table.insert(cells, current)
     src_lines = {}
+    src_rows  = {}
+    out_lines = {}
+    in_output = false
   end
 
   for i, line in ipairs(lines) do
-    local row = i - 1  -- 0-indexed
-    local cell_type = M.parse_separator(line)
-    if cell_type then
-      flush(row)
-      current = { cell_type = cell_type, sep_row = row }
-    elseif current then
-      table.insert(src_lines, line)
+    local row = i - 1   -- 0-indexed
+    if line == OUTPUT_SEP then
+      if current and not in_output then
+        -- Record source_end_row as the last non-blank source row seen so far
+        local last_nonblank = current.sep_row
+        for j = #src_lines, 1, -1 do
+          if src_lines[j] ~= "" then
+            last_nonblank = src_rows[j]
+            break
+          end
+        end
+        current.source_end_row = last_nonblank
+        current.output_sep_row = row
+        in_output = true
+      end
+    else
+      local cell_type = M.parse_separator(line)
+      if cell_type then
+        in_output = false
+        flush(row)
+        current = { cell_type = cell_type, sep_row = row }
+      elseif current then
+        if in_output then
+          table.insert(out_lines, { row = row, line = line })
+        else
+          table.insert(src_lines, line)
+          table.insert(src_rows, row)
+        end
+      end
     end
   end
   flush(nil)
 
+  for i, c in ipairs(cells) do c.cell_index = i end
   return cells
 end
 
 --- Return cell_type if `line` is a cell separator, otherwise nil.
+--- Returns nil for output block separators (# %% [out]).
 ---@param line string
 ---@return string|nil cell_type  "code" | "markdown" | "raw" | nil
 function M.parse_separator(line)
-  -- Matches:  # %%  optionally followed by  [type]  or  type
   local rest = line:match("^# %%%% ?(.*)")
   if rest == nil then return nil end
 
@@ -150,6 +208,7 @@ function M.parse_separator(line)
   t = t:lower():gsub("^%s+", ""):gsub("%s+$", "")
   if t == "markdown" or t == "md" then return "markdown"
   elseif t == "raw"                then return "raw"
+  elseif t == "out"                then return nil   -- output block, not a cell
   else                              return "code"
   end
 end
@@ -157,13 +216,12 @@ end
 --- Given a bufnr and a 0-indexed cursor row, return info about the containing cell.
 ---@param bufnr integer
 ---@param cursor_row integer 0-indexed
----@return table|nil  {cell_type, sep_row, end_row, cell_index}
+---@return table|nil  {cell_type, sep_row, source_end_row, end_row, output_sep_row, output_end_row, cell_index}
 function M.cell_at_row(bufnr, cursor_row)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local cells = M.lines_to_cells(lines)
-  for i, c in ipairs(cells) do
+  for _, c in ipairs(cells) do
     if cursor_row >= c.sep_row and cursor_row <= c.end_row then
-      c.cell_index = i
       return c
     end
   end
@@ -177,6 +235,10 @@ function M.make_separator(cell_type)
   elseif cell_type == "raw"  then return "# %% [raw]"
   else                            return "# %%"
   end
+end
+
+function M.make_output_separator()
+  return OUTPUT_SEP
 end
 
 function M._join_source(src)

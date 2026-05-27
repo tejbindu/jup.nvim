@@ -135,29 +135,34 @@ function M.run_all()
   local cells = buf.all_cells(bufnr)
   if #cells == 0 then return end
 
+  -- Collect indices of all cells; re-scan before each execution so row positions
+  -- are always current (output block insertions shift subsequent rows).
+  local indices = {}
+  for _, c in ipairs(cells) do table.insert(indices, c.cell_index) end
+
   M._ensure_connected(bufnr, function(err)
     if err then return end
-    M._run_sequence(bufnr, cells, 1, nil)
+    M._run_sequence(bufnr, indices, 1, nil)
   end)
 end
 
 --- Execute all cells above the cursor (exclusive).
 function M.run_above()
-  local bufnr     = vim.api.nvim_get_current_buf()
-  local cur_cell  = buf.current_cell(bufnr)
+  local bufnr    = vim.api.nvim_get_current_buf()
+  local cur_cell = buf.current_cell(bufnr)
   if not cur_cell then return end
 
-  local cells = buf.all_cells(bufnr)
-  local above = {}
+  local cells   = buf.all_cells(bufnr)
+  local indices = {}
   for _, c in ipairs(cells) do
-    if c.sep_row < cur_cell.sep_row then
-      table.insert(above, c)
+    if c.cell_index < cur_cell.cell_index then
+      table.insert(indices, c.cell_index)
     end
   end
 
   M._ensure_connected(bufnr, function(err)
     if err then return end
-    M._run_sequence(bufnr, above, 1, nil)
+    M._run_sequence(bufnr, indices, 1, nil)
   end)
 end
 
@@ -167,17 +172,17 @@ function M.run_below()
   local cur_cell = buf.current_cell(bufnr)
   if not cur_cell then return end
 
-  local cells = buf.all_cells(bufnr)
-  local below = {}
+  local cells   = buf.all_cells(bufnr)
+  local indices = {}
   for _, c in ipairs(cells) do
-    if c.sep_row >= cur_cell.sep_row then
-      table.insert(below, c)
+    if c.cell_index >= cur_cell.cell_index then
+      table.insert(indices, c.cell_index)
     end
   end
 
   M._ensure_connected(bufnr, function(err)
     if err then return end
-    M._run_sequence(bufnr, below, 1, nil)
+    M._run_sequence(bufnr, indices, 1, nil)
   end)
 end
 
@@ -191,20 +196,21 @@ function M.clear_outputs()
 end
 
 --- Yank the output of the cell under the cursor into the clipboard.
+--- Reads directly from the output block lines in the buffer.
 function M.yank_cell_output()
-  local bufnr  = vim.api.nvim_get_current_buf()
-  local cell   = buf.current_cell(bufnr)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cell  = buf.current_cell(bufnr)
   if not cell then
     vim.notify("[jup.nvim] cursor is not inside a cell", vim.log.levels.WARN)
     return
   end
-  local cell_id = buf.cell_exec_id(bufnr, cell.sep_row)
-  local outputs = kernel.get_cell_outputs(bufnr, cell_id)
-  if not outputs or #outputs == 0 then
+  if not cell.output_sep_row then
     vim.notify("[jup.nvim] no output for this cell", vim.log.levels.INFO)
     return
   end
-  local text = output.outputs_to_text(outputs)
+  -- output block: rows (output_sep_row+1) .. output_end_row (skip the # %% [out] line)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, cell.output_sep_row + 1, cell.output_end_row + 1, false)
+  local text  = table.concat(lines, "\n")
   vim.fn.setreg("+", text)
   vim.fn.setreg('"', text)
   vim.notify("[jup.nvim] output copied to clipboard", vim.log.levels.INFO)
@@ -212,11 +218,10 @@ end
 
 --- Clear output for the cell under the cursor.
 function M.clear_cell_output()
-  local bufnr   = vim.api.nvim_get_current_buf()
-  local cell    = buf.current_cell(bufnr)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cell  = buf.current_cell(bufnr)
   if not cell then return end
-  local cell_id = buf.cell_exec_id(bufnr, cell.sep_row)
-  kernel.clear_cell_output(bufnr, cell_id)
+  kernel.clear_cell_output(bufnr, cell.cell_index)
 end
 
 -- ── Cell navigation ───────────────────────────────────────────────────────────
@@ -425,34 +430,33 @@ end
 
 function M._execute_cell(bufnr, cell, callback)
   if cell.cell_type ~= "code" then
-    vim.notify("[jup.nvim] skipping non-code cell", vim.log.levels.INFO)
     if callback then callback(nil) end
     return
   end
 
-  local code      = cell.source
-  local sep_row   = cell.sep_row
-  local anchor    = cell.end_row
-  local cell_id   = buf.cell_exec_id(bufnr, sep_row)
-
-  kernel.execute(bufnr, cell_id, code, sep_row, anchor, function(err)
+  local cell_id = buf.cell_exec_id(bufnr, cell.cell_index)
+  kernel.execute(bufnr, cell_id, cell.source, cell.cell_index, function(err)
     if callback then callback(err) end
   end)
 end
 
---- Run `cells[index]` then proceed to the next.
-function M._run_sequence(bufnr, cells, index, on_all_done)
-  if index > #cells then
+--- Run cells identified by `indices[i]` then proceed to the next.
+--- Re-scans the buffer before each cell so row positions are always current
+--- (output block insertions from prior cells shift subsequent rows).
+function M._run_sequence(bufnr, indices, i, on_all_done)
+  if i > #indices then
     if on_all_done then on_all_done() end
     return
   end
-  local cell = cells[index]
-  if cell.cell_type ~= "code" then
-    M._run_sequence(bufnr, cells, index + 1, on_all_done)
+  local cell_index = indices[i]
+  local cells      = buf.all_cells(bufnr)
+  local cell       = cells[cell_index]
+  if not cell or cell.cell_type ~= "code" then
+    M._run_sequence(bufnr, indices, i + 1, on_all_done)
     return
   end
   M._execute_cell(bufnr, cell, function(_)
-    M._run_sequence(bufnr, cells, index + 1, on_all_done)
+    M._run_sequence(bufnr, indices, i + 1, on_all_done)
   end)
 end
 
