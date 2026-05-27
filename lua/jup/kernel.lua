@@ -10,6 +10,11 @@ local output  = require("jup.output")
 -- [bufnr] = { job_id, line_buf, request_id, pending, output_handlers, cell_outputs }
 local _state = {}
 
+-- Extmark IDs for outputs restored from disk at load time, not from kernel execution.
+-- Stored separately because kernel._state doesn't exist yet at restore time.
+-- [bufnr][cell_id] = extmark_id
+local _restored_extmarks = {}
+
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
 local function bridge_script()
@@ -225,6 +230,16 @@ function M.stop(bufnr)
   if not st then return end
   pcall(vim.fn.jobstop, st.job_id)
   _state[bufnr] = nil
+  _restored_extmarks[bufnr] = nil
+end
+
+--- Register an extmark ID that was placed at load time (not from kernel execution).
+--- Called from buffer._restore_outputs so kernel.execute can clear it on re-run.
+function M.register_restored_extmark(bufnr, cell_id, eid)
+  if not _restored_extmarks[bufnr] then
+    _restored_extmarks[bufnr] = {}
+  end
+  _restored_extmarks[bufnr][cell_id] = eid
 end
 
 --- Return true if a bridge is running for `bufnr`.
@@ -285,8 +300,13 @@ function M.execute(bufnr, cell_id, code, sep_row, anchor_row, callback)
   st.cell_anchors[cell_id]    = anchor_row
   st.cell_sep_rows[cell_id]   = sep_row
 
-  -- Clear previous output
-  output.clear_cell_output(bufnr, st.output_extmarks[cell_id])
+  -- Clear previous output: either from a prior execution or restored from disk
+  local prev_eid = st.output_extmarks[cell_id]
+  if not prev_eid and _restored_extmarks[bufnr] then
+    prev_eid = _restored_extmarks[bufnr][cell_id]
+    _restored_extmarks[bufnr][cell_id] = nil
+  end
+  output.clear_cell_output(bufnr, prev_eid)
   st.output_extmarks[cell_id] = nil
 
   output.set_running(bufnr, sep_row, true)

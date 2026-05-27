@@ -27,8 +27,8 @@ function M.load(bufnr, path)
 
   local raw = M._read_file(path)
 
-  -- File doesn't exist yet → scaffold a blank notebook
-  if not raw then
+  -- File doesn't exist or is empty (e.g., just created by a file manager) → scaffold
+  if not raw or raw == "" then
     M._scaffold(bufnr, path)
     return
   end
@@ -85,7 +85,10 @@ end
 ---@param bufnr integer
 function M.save(bufnr)
   local st = _state[bufnr]
-  if not st then return end
+  if not st then
+    vim.notify("[jup.nvim] buffer state lost — try reopening the file", vim.log.levels.WARN)
+    return
+  end
 
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local parsed = notebook.lines_to_cells(lines)
@@ -209,7 +212,10 @@ end
 function M._attach_autocmds(bufnr)
   local grp = vim.api.nvim_create_augroup("jup_buf_" .. bufnr, { clear = true })
 
-  vim.api.nvim_create_autocmd("BufDelete", {
+  -- BufWipeout (not BufDelete): BufDelete fires when buflisted is set to false,
+  -- which scope.nvim does on every tab switch, destroying state we need to keep.
+  -- BufWipeout only fires when the buffer is truly removed from memory.
+  vim.api.nvim_create_autocmd("BufWipeout", {
     group  = grp,
     buffer = bufnr,
     callback = function()
@@ -223,8 +229,10 @@ function M._attach_autocmds(bufnr)
     group    = grp,
     buffer   = bufnr,
     callback = function()
-      if M._decorate_timer then M._decorate_timer:stop() end
-      M._decorate_timer = vim.defer_fn(function()
+      local st = _state[bufnr]
+      if not st then return end
+      if st._decorate_timer then st._decorate_timer:stop() end
+      st._decorate_timer = vim.defer_fn(function()
         if vim.api.nvim_buf_is_valid(bufnr) then
           output.decorate_separators(bufnr)
         end
@@ -258,9 +266,11 @@ function M._restore_outputs(bufnr, cells)
   for i, pc in ipairs(parsed) do
     local c = cells[i]
     if c and c.cell_type == "code" and c.outputs and #c.outputs > 0 then
-      -- Compute anchor row (last line of cell content, not separator)
       local anchor = pc.end_row
-      output.set_cell_output(bufnr, anchor, c.outputs, nil)
+      local eid = output.set_cell_output(bufnr, anchor, c.outputs, nil)
+      -- Register with kernel module so execute() can clear it on re-run
+      local cell_id = M.cell_exec_id(bufnr, pc.sep_row)
+      kernel.register_restored_extmark(bufnr, cell_id, eid)
     end
   end
 end

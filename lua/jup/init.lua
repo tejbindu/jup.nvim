@@ -26,7 +26,7 @@ end
 --- Connect to or start a kernel for the current notebook buffer.
 ---@param opts table|nil  {kernel_name?, connection_file?}
 function M.connect(opts)
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   if not buf.is_loaded(bufnr) then
     vim.notify("[jup.nvim] current buffer is not a notebook", vim.log.levels.WARN)
     return
@@ -45,14 +45,14 @@ end
 
 --- Stop the kernel bridge for the current buffer.
 function M.disconnect()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   kernel.stop(bufnr)
   vim.notify("[jup.nvim] kernel disconnected", vim.log.levels.INFO)
 end
 
 --- Restart the kernel.
 function M.restart()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   kernel.restart(bufnr, function(err, _)
     if err then
       vim.notify("[jup.nvim] restart failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -64,7 +64,7 @@ end
 
 --- Interrupt the running kernel.
 function M.interrupt()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   kernel.interrupt(bufnr, function(err, _)
     if err then
       vim.notify("[jup.nvim] interrupt failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -76,7 +76,7 @@ end
 
 --- Show kernel info in a notification.
 function M.kernel_info()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   kernel.kernel_info(bufnr, function(err, data)
     if err then
       vim.notify("[jup.nvim] " .. tostring(err), vim.log.levels.ERROR)
@@ -92,7 +92,7 @@ end
 --- Return true if a kernel bridge is connected for the current buffer.
 --- Useful for statusline integrations.
 function M.is_connected()
-  return kernel.is_running(vim.api.nvim_get_current_buf())
+  return kernel.is_running(_notebook_buf())
 end
 
 -- ── Cell execution ─────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ end
 
 --- Execute all cells sequentially.
 function M.run_all()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   local cells = buf.all_cells(bufnr)
   if #cells == 0 then return end
 
@@ -169,7 +169,7 @@ end
 
 --- Clear all outputs in the current buffer.
 function M.clear_outputs()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   kernel.clear_outputs(bufnr)
   buf.clear_stored_outputs(bufnr)
 end
@@ -289,14 +289,13 @@ end
 -- ── Save ─────────────────────────────────────────────────────────────────────
 
 function M.save()
-  local bufnr = vim.api.nvim_get_current_buf()
-  buf.save(bufnr)
+  buf.save(_notebook_buf())
 end
 
 -- ── Status ────────────────────────────────────────────────────────────────────
 
 function M.show_status()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr = _notebook_buf()
   local path  = buf.get_path(bufnr)
   if not path then
     vim.notify("[jup.nvim] not a notebook buffer", vim.log.levels.WARN)
@@ -328,6 +327,21 @@ function M._register_autocmds()
     pattern = "*.ipynb",
     callback = function(ev)
       buf.save(ev.buf)
+    end,
+  })
+
+  -- Re-initialize if state was lost while the buffer was hidden (e.g., a plugin
+  -- called :bdelete which fires BufDelete → cleanup, but the buffer still exists).
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    group   = grp,
+    pattern = "*.ipynb",
+    callback = function(ev)
+      if not buf.is_loaded(ev.buf) and not vim.bo[ev.buf].modified then
+        local path = vim.api.nvim_buf_get_name(ev.buf)
+        if path ~= "" then
+          buf.load(ev.buf, path)
+        end
+      end
     end,
   })
 end
@@ -377,6 +391,20 @@ function M._apply_keymaps(bufnr)
 end
 
 -- ── Internal helpers ──────────────────────────────────────────────────────────
+
+-- Return the current buffer if it is a loaded notebook, otherwise search the
+-- current tab's windows for one. This lets kernel/save commands work even when
+-- the cursor is sitting in a sidebar (neotree, etc.) with the notebook visible
+-- in another window.
+local function _notebook_buf()
+  local cur = vim.api.nvim_get_current_buf()
+  if buf.is_loaded(cur) then return cur end
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local b = vim.api.nvim_win_get_buf(win)
+    if buf.is_loaded(b) then return b end
+  end
+  return cur  -- caller's "not a notebook" error handles this
+end
 
 function M._ensure_connected(bufnr, callback)
   if kernel.is_running(bufnr) then
