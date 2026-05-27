@@ -20,6 +20,7 @@ function M.setup_highlights()
     JupSeparatorMd = { link = "Title",           default = true },
     JupRunning     = { link = "DiagnosticWarn",  default = true },
     JupExecCount   = { link = "Number",          default = true },
+    JupOutputSep   = { link = "Comment",         default = true },
   }
   for name, opts in pairs(hls) do
     vim.api.nvim_set_hl(0, name, opts)
@@ -46,6 +47,12 @@ end
 
 local function bot_border(width)
   return "╰" .. string.rep("─", math.max(0, width - 2)) .. "╯"
+end
+
+local function out_border(width)
+  local label  = "─ output "
+  local dashes = width - #label - 2  -- ├ and ┤
+  return "├" .. label .. string.rep("─", math.max(0, dashes)) .. "┤"
 end
 
 -- ─── Separator / cell decoration ─────────────────────────────────────────────
@@ -90,6 +97,23 @@ local function render_sep(bufnr, cell_index, sep_row, cell_type, running, exec_c
   }
 end
 
+local function render_out_sep(bufnr, cell_index, out_sep_row)
+  local width = win_content_width(bufnr)
+  local ns    = M.ns_sep()
+  local state = (_sep_state[bufnr] or {})[cell_index]
+  local id    = state and state.out_mark_id or nil
+  local opts  = {
+    virt_text     = { { out_border(width), "JupOutputSep" } },
+    virt_text_pos = "overlay",
+    priority      = 150,
+  }
+  if id then opts.id = id end
+  local new_id = vim.api.nvim_buf_set_extmark(bufnr, ns, out_sep_row, 0, opts)
+  if not _sep_state[bufnr] then _sep_state[bufnr] = {} end
+  if not _sep_state[bufnr][cell_index] then _sep_state[bufnr][cell_index] = {} end
+  _sep_state[bufnr][cell_index].out_mark_id = new_id
+end
+
 --- Redraw all cell borders for `bufnr`.
 --- Preserves running/exec_count state from the previous decoration.
 function M.decorate_separators(bufnr)
@@ -110,6 +134,10 @@ function M.decorate_separators(bufnr)
   for i, cell in ipairs(cells) do
     local prev = prev_state[i] or {}
     render_sep(bufnr, i, cell.sep_row, cell.cell_type, prev.running or false, prev.exec_count)
+
+    if cell.output_sep_row then
+      render_out_sep(bufnr, i, cell.output_sep_row)
+    end
 
     local hl       = cell.cell_type == "markdown" and "JupSeparatorMd" or "JupSeparator"
     local next_cell = cells[i + 1]
@@ -222,14 +250,18 @@ function M.set_output_block(bufnr, cell_index, text_lines)
   local block = { notebook.make_output_separator() }
   for _, l in ipairs(text_lines) do table.insert(block, l) end
 
+  local out_sep_row
   if cell.output_sep_row then
-    -- Replace existing block
+    -- Replace existing block; nvim_buf_set_lines destroys the extmark so we re-place it
     vim.api.nvim_buf_set_lines(bufnr, cell.output_sep_row, cell.output_end_row + 1, false, block)
+    out_sep_row = cell.output_sep_row
   else
     -- Insert after last source line
     local insert_at = cell.source_end_row + 1
     vim.api.nvim_buf_set_lines(bufnr, insert_at, insert_at, false, block)
+    out_sep_row = insert_at
   end
+  render_out_sep(bufnr, cell_index, out_sep_row)
 end
 
 --- Remove the output block for cell `cell_index` (no-op if none exists).
@@ -241,6 +273,12 @@ function M.clear_output_block(bufnr, cell_index)
   local cells    = notebook.lines_to_cells(lines)
   local cell     = cells[cell_index]
   if not cell or not cell.output_sep_row then return end
+  -- Delete extmark before removing lines to prevent Neovim from pushing it to the wrong row
+  local state = (_sep_state[bufnr] or {})[cell_index]
+  if state and state.out_mark_id then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, M.ns_sep(), state.out_mark_id)
+    state.out_mark_id = nil
+  end
   vim.api.nvim_buf_set_lines(bufnr, cell.output_sep_row, cell.output_end_row + 1, false, {})
 end
 
